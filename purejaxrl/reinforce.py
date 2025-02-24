@@ -70,8 +70,8 @@ def make_train(config):
         init_x = jnp.zeros(env.observation_space(env_params).shape)
         network_params = network.init(_rng, init_x)
         tx = optax.chain(
-            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            optax.adam(config["LR"], eps=1e-5),
+            # optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.rmsprop(config["LR"], eps=1e-5),
         )
         train_state = TrainState.create(
             apply_fn=network.apply, params=network_params, tx=tx
@@ -168,7 +168,7 @@ def make_train(config):
         # ------------------------------------------------------------
         # Compute Discounted Returns for a Single Trajectory
         # ------------------------------------------------------------
-        def compute_returns(rewards, length):
+        def compute_returns_old(rewards, length):
             # Compute G_t = r_t + gamma * G_{t+1} for valid steps only.
             def body_fun(carry, r):
                 return carry * config["GAMMA"] + r, carry * config["GAMMA"] + r
@@ -179,6 +179,18 @@ def make_train(config):
             pad_size = max_ep_len - length
             returns = jnp.concatenate([returns_valid, jnp.zeros(pad_size)])
             return returns
+    
+        def compute_returns(rewards, mask):
+            # rewards: shape (max_ep_len,), mask: shape (max_ep_len,) with 1 for valid steps and 0 for padded steps.
+            def body_fun(carry, r_m):
+                r, m = r_m
+                new_carry = r + config["GAMMA"] * carry * m
+                return new_carry, new_carry
+            # Process in reverse order and then flip back
+            _, returns = jax.lax.scan(body_fun, 0.0, (rewards[::-1], mask[::-1]))
+            returns = returns[::-1]
+            return returns
+
 
         # Vectorize return computation over a batch (one trajectory per environment).
         v_compute_returns = jax.vmap(compute_returns, in_axes=(0, 0))
@@ -186,7 +198,99 @@ def make_train(config):
         # ------------------------------------------------------------
         # UPDATE STEP: Collect one trajectory per env, compute loss & update.
         # ------------------------------------------------------------
+        
+
         def _update_step(runner_state, unused):
+            train_state, env_state, obsv, rng = runner_state
+            rng, rng_epi = jax.random.split(rng)
+            epi_rngs = jax.random.split(rng_epi, config["NUM_ENVS"])
+            # Run episodes in parallel across NUM_ENVS.
+            results = jax.vmap(run_episode, in_axes=(None, 0, 0, 0))(
+                train_state, env_state, obsv, epi_rngs
+            )
+            traj_batch, new_env_state, new_obsv, rngs = results
+            # traj_batch is a dict with keys: "obs", "actions", "rewards", "log_probs", "values", "length"
+            lengths = traj_batch["length"]  # shape: (NUM_ENVS,)
+
+            # Create a mask for valid timesteps in each trajectory.
+            timesteps = jnp.arange(max_ep_len)[None, :]  # shape (1, max_ep_len)
+            masks = timesteps < lengths[:, None]           # shape (NUM_ENVS, max_ep_len)
+
+            # Compute discounted returns.
+            returns = v_compute_returns(traj_batch["rewards"], masks)
+            # For a baseline version, advantages could be returns minus the stored values,
+            # but here we recompute the loss so that gradients flow properly.
+            advantages = returns - traj_batch["values"]
+
+            # Flatten the batch (across envs and timesteps) and apply the mask.
+            flat_mask = masks.flatten()
+            flat_advantages = advantages.reshape(-1)
+            flat_returns = returns.reshape(-1)
+            flat_obs = traj_batch["obs"].reshape(-1, *traj_batch["obs"].shape[2:])
+            flat_actions = traj_batch["actions"].reshape(-1)
+
+            # Prepare a batch dictionary.
+            batch = {
+                "flat_obs": flat_obs,
+                "flat_actions": flat_actions,
+                "flat_advantages": flat_advantages,
+                "flat_returns": flat_returns,
+                "flat_mask": flat_mask,
+            }
+
+            # Define an explicit loss function.
+            def loss_fn(params, batch):
+                # Re-run the network to obtain current outputs.
+                pi, current_values = network.apply(params, batch["flat_obs"])
+                current_log_probs = pi.log_prob(batch["flat_actions"])
+                total_mask = jnp.sum(batch["flat_mask"])
+                # Compute policy loss (using the freshly computed log probs).
+                policy_loss = -jnp.sum(current_log_probs * batch["flat_advantages"] * batch["flat_mask"]) / total_mask
+                # Compute value loss.
+                value_loss = jnp.sum(jnp.square(batch["flat_returns"] - current_values) * batch["flat_mask"]) / total_mask
+                # Compute entropy bonus.
+                entropy_loss = -jnp.sum(pi.entropy() * batch["flat_mask"]) / total_mask
+                total_loss = policy_loss + config["VF_COEF"] * value_loss + config.get("ENT_COEF", 0.0) * entropy_loss
+                return total_loss, (policy_loss, value_loss, entropy_loss)
+
+            # Compute loss and gradients.
+            (total_loss, (policy_loss, value_loss, entropy_loss)), grads = \
+                jax.value_and_grad(loss_fn, has_aux=True)(train_state.params, batch)
+            train_state = train_state.apply_gradients(grads=grads)
+
+            # Compute additional metrics for logging.
+            episode_returns = jnp.sum(traj_batch["rewards"] * masks, axis=1)
+            mean_return = jnp.mean(episode_returns)
+            mean_length = jnp.mean(traj_batch["length"])
+
+            # Debug callback to print training statistics.
+            if config.get("DEBUG"):
+                def debug_callback(info):
+                    print(f"Loss: {info['loss']:.3f}, Mean Return: {info['mean_return']:.3f}, Mean Length: {info['mean_length']:.1f}")
+                    print(f"Policy Loss: {info['policy_loss']:.3f}, Value Loss: {info['value_loss']:.3f}, Entropy Loss: {info['entropy_loss']:.3f}")
+                    print(f"Valid Count: {info['valid_count']}")
+                jax.debug.callback(debug_callback, {
+                    "loss": total_loss,
+                    "mean_return": mean_return,
+                    "mean_length": mean_length,
+                    "valid_count": jnp.sum(flat_mask),
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
+                    "entropy_loss": entropy_loss,
+                })
+
+            # Reset the environments for the next update step.
+            rng, rng_reset = jax.random.split(rng)
+            reset_rngs = jax.random.split(rng_reset, config["NUM_ENVS"])
+            new_obsv, new_env_state = jax.vmap(env.reset, in_axes=(0, None))(
+                reset_rngs, env_params
+            )
+            new_runner_state = (train_state, new_env_state, new_obsv, rng)
+            return new_runner_state, total_loss
+
+
+
+        def _update_step_old(runner_state, unused):
             train_state, env_state, obsv, rng = runner_state
             rng, rng_epi = jax.random.split(rng)
             epi_rngs = jax.random.split(rng_epi, config["NUM_ENVS"])
@@ -203,19 +307,27 @@ def make_train(config):
             masks = timesteps < lengths[:, None]  # shape (NUM_ENVS, max_ep_len)
 
             # Compute discounted returns and then advantages (return - baseline).
-            returns = v_compute_returns(traj_batch["rewards"], lengths)
+            # v_compute_returns = jax.vmap(compute_returns, in_axes=(0, 0))
+            returns = v_compute_returns(traj_batch["rewards"], masks)
+            # centered_advantages = returns - (jnp.sum(returns * masks) / jnp.sum(masks))
+            # returns = v_compute_returns(traj_batch["rewards"], lengths)
             advantages = returns - traj_batch["values"]
+            # vanilla reinfore
+            # advantages = advantages -  (jnp.sum(advantages * masks) / jnp.sum(masks))
+            # advantages = centered_advantages
 
             # Flatten the batch (across envs and timesteps) and use the mask.
             flat_mask = masks.flatten()
-            flat_log_probs = traj_batch["log_probs"].reshape(-1)
+            # flat_log_probs = traj_batch["log_probs"].reshape(-1)
             flat_advantages = advantages.reshape(-1)
             flat_values = traj_batch["values"].reshape(-1)
             flat_returns = returns.reshape(-1)
 
             # To compute an entropy bonus, re-run the network on the observations.
             flat_obs = traj_batch["obs"].reshape(-1, *traj_batch["obs"].shape[2:])
-            pi, _ = network.apply(train_state.params, flat_obs)
+            pi, current_values = network.apply(train_state.params, flat_obs)
+            flat_log_probs = pi.log_prob(traj_batch["actions"].reshape(-1)) * flat_mask
+            # flat_log_probs = current_log_probs.reshape(-1) * flat_mask
             entropy = pi.entropy()
 
             valid_count = jnp.sum(flat_mask)
@@ -223,11 +335,34 @@ def make_train(config):
             value_loss = jnp.sum(jnp.square(flat_returns - flat_values) * flat_mask) / valid_count
             entropy_loss = -jnp.sum(entropy * flat_mask) / valid_count
 
-            total_loss = policy_loss + config["VF_COEF"] * value_loss + config["ENT_COEF"] * entropy_loss
+            total_loss = policy_loss  + config["VF_COEF"] * value_loss
+            # + config["ENT_COEF"] * entropy_loss
 
+                # Compute additional metrics: mean episode return and mean episode length.
+            episode_returns = jnp.sum(traj_batch["rewards"] * masks, axis=1)
+            mean_return = jnp.mean(episode_returns)
+            mean_length = jnp.mean(traj_batch["length"])
             # Compute gradients and update the network parameters.
             grads = jax.grad(lambda params: total_loss)(train_state.params)
             train_state = train_state.apply_gradients(grads=grads)
+             # Print training stats if DEBUG is enabled.
+            if config.get("DEBUG"):
+                def debug_callback(info):
+                    print(f"Loss: {info['loss']:.3f}, Mean Return: {info['mean_return']:.3f}, Mean Length: {info['mean_length']:.1f}")
+                    print(f"Policy Loss: {info['policy_loss']:.3f}, Value Loss: {info['value_loss']:.3f}, Entropy Loss: {info['entropy_loss']:.3f}")
+                    print(f"Valid Count: {info['valid_count']}")
+
+                    # print(f"Loss: {loss:.3f}")
+                jax.debug.callback(debug_callback, {
+                    "loss": total_loss,
+                    "mean_return": mean_return,
+                    "mean_length": mean_length,
+                    "valid_count": valid_count,
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
+                    "entropy_loss": entropy_loss,
+                })
+
 
             # Reset the environments for the next update step.
             rng, rng_reset = jax.random.split(rng)
@@ -235,6 +370,7 @@ def make_train(config):
             new_obsv, new_env_state = jax.vmap(env.reset, in_axes=(0, None))(
                 reset_rngs, env_params
             )
+
             new_runner_state = (train_state, new_env_state, new_obsv, rng)
             return new_runner_state, total_loss
 
@@ -248,16 +384,18 @@ def make_train(config):
 
 
 if __name__ == "__main__":
+    import jax
+    # jax.config.update("jax_disable_jit", True)
     config = {
-        "LR": 1e-3,
-        "NUM_ENVS": 4,
-        "TOTAL_EPISODES": 500,  # Total update iterations (each based on NUM_ENVS full episodes)
+        "LR": 5e-4,
+        "NUM_ENVS": 32,
+        "TOTAL_EPISODES": 10000,  # Total update iterations (each based on NUM_ENVS full episodes)
         "GAMMA": 0.99,
-        "ENT_COEF": 0.01,
+        # "ENT_COEF": 0.01,
         "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "tanh",
-        "ENV_NAME": "CartPole-v1",
+        "MAX_GRAD_NORM": 0.5, 
+        "ACTIVATION": "relu",
+        "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,
         "DEBUG": True,
     }

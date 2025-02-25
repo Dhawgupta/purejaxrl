@@ -23,11 +23,11 @@ class ActorCritic(nn.Module):
             activation = nn.tanh
         # Actor network.
         actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            8, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            8, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
@@ -36,19 +36,20 @@ class ActorCritic(nn.Module):
         pi = distrax.Categorical(logits=actor_mean)
 
         # Critic network (not used in IS objective, but computed).
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        critic = nn.Dense(
-            1, kernel_init=orthogonal(1.0), bias_init=constant(0.0)
-        )(critic)
+        # critic = nn.Dense(
+        #     64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        # )(x)
+        # critic = activation(critic)
+        # critic = nn.Dense(
+        #     64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        # )(critic)
+        # critic = activation(critic)
+        # critic = nn.Dense(
+        #     1, kernel_init=orthogonal(1.0), bias_init=constant(0.0)
+        # )(critic)
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        # return pi, jnp.squeeze(critic, axis=-1)
+        return pi, 0.0
 
 
 def make_train(config):
@@ -288,18 +289,18 @@ def make_train(config):
 
 if __name__ == "__main__":
     import jax
-    jax.config.update("jax_disable_jit", True)
+    # jax.config.update("jax_disable_jit", True)
     config = {
-        "LR": 5e-4,
+        "LR": 2.5e-4,
         "NUM_ENVS": 32,
         "TOTAL_EPISODES": 10000,  # Total update iterations (each based on NUM_ENVS full episodes)
-        "GAMMA": 0.999,
+        "GAMMA": 1.0,
         "VF_COEF": 0.5,  # Not used in the IS objective here.
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
         "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,
-        "NUM_UPDATES_PER_BATCH": 10,
+        "NUM_UPDATES_PER_BATCH": 20,
         "DEBUG": True,
     }
     rng = jax.random.PRNGKey(30)

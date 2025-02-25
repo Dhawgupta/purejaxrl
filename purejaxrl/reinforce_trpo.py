@@ -24,11 +24,11 @@ class ActorCritic(nn.Module):
             activation = nn.tanh
         # Actor network.
         actor_mean = nn.Dense(
-            16, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            8, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
-            16, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            8, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
@@ -89,6 +89,151 @@ def compute_sample_mean(params_flat, batch, network, unravel_fn):
 grad_objective = jax.grad(compute_objective, argnums=0)
 grad_kl = jax.grad(compute_constraint_kl, argnums=0)
 grad_mean = jax.grad(compute_sample_mean, argnums=0)
+
+def dual_ascent_linear_obj_linear_con_all_jit(params_flat, dataset, network, unravel_fn, 
+                                                delta=0.4, epsilon=0.05,
+                                                tau=1.0, alpha_dual=1e-2, tol=1e-4,
+                                                max_dual_iters=50):
+    """
+    Computes an update s such that the new policy = policy + s satisfies
+    the following linearly approximated constraints:
+      1) c1 + d1^T s <= delta,
+      2) 1-epsilon <= c2 + d2^T s <= 1+epsilon,
+    while maximizing the linearized objective with quadratic regularization:
+      max_s   g^T s - (1/(2*tau)) ||s||^2.
+    The unconstrained optimum is s0 = tau * g.
+    If s0 violates any constraint, dual ascent is performed.
+    """
+    # First-order quantities at the current parameters.
+    g      = grad_objective(params_flat, dataset, network, unravel_fn)
+    c1_val = compute_constraint_kl(params_flat, dataset, network, unravel_fn)
+    c2_val = compute_sample_mean(params_flat, dataset, network, unravel_fn)
+    d1     = grad_kl(params_flat, dataset, network, unravel_fn)
+    d2     = grad_mean(params_flat, dataset, network, unravel_fn)
+
+    # Unconstrained update.
+    s0 = tau * g
+
+    # Linear approximations of the constraints at s0.
+    c1_approx0 = c1_val + jnp.dot(d1, s0)
+    c2_approx0 = c2_val + jnp.dot(d2, s0)
+
+    unconstrained_feasible = (c1_approx0 <= delta) & (((1 - epsilon) <= c2_approx0) & (c2_approx0 <= (1 + epsilon)))
+    
+    def dual_cond(state):
+        i, lambda1, lambda2, lambda3, s = state
+        c1_approx = c1_val + jnp.dot(d1, s)
+        c2_approx = c2_val + jnp.dot(d2, s)
+        v1 = jnp.maximum(0.0, c1_approx - delta)
+        v2 = jnp.maximum(0.0, c2_approx - (1 + epsilon))
+        v3 = jnp.maximum(0.0, (1 - epsilon) - c2_approx)
+        violation = (v1 >= tol) | (v2 >= tol) | (v3 >= tol)
+        return violation & (i < max_dual_iters)
+    
+    def dual_body(state):
+        i, lambda1, lambda2, lambda3, s = state
+        # With linear approximations, the optimal update is given in closed form.
+        s_new = tau * (g - lambda1 * d1 - (lambda2 - lambda3) * d2)
+        c1_approx = c1_val + jnp.dot(d1, s_new)
+        c2_approx = c2_val + jnp.dot(d2, s_new)
+        lambda1_new = jnp.maximum(0.0, lambda1 + alpha_dual * (c1_approx - delta))
+        lambda2_new = jnp.maximum(0.0, lambda2 + alpha_dual * (c2_approx - (1 + epsilon)))
+        lambda3_new = jnp.maximum(0.0, lambda3 + alpha_dual * ((1 - epsilon) - c2_approx))
+        return (i + 1, lambda1_new, lambda2_new, lambda3_new, s_new)
+    
+    def dual_ascent_loop():
+        init_state = (0, 0.0, 0.0, 0.0, s0)
+        final_state = jax.lax.while_loop(dual_cond, dual_body, init_state)
+        return final_state[4]
+    
+    s_final = jax.lax.cond(unconstrained_feasible,
+                           lambda _: s0,
+                           lambda _: dual_ascent_loop(),
+                           operand=None)
+    return s_final
+
+def dual_ascent_linear_obj_linear_con_all_quasi_jit(params_flat, dataset, network, unravel_fn, 
+                                                     delta=0.4, epsilon=0.05,
+                                                     tau=1.0, tol=1e-4,
+                                                     max_dual_iters=50):
+    """
+    Same as before but using a quasi-Newton update (e.g. BFGS) for the dual variables.
+    Here we treat the dual variables as a vector λ = [λ₁, λ₂, λ₃] and update them via
+      λ_new = max(0, λ + H_inv * grad_dual),
+    where grad_dual contains the linearized constraint violations.
+    """
+    # First-order quantities at current parameters.
+    g      = grad_objective(params_flat, dataset, network, unravel_fn)
+    c1_val = compute_constraint_kl(params_flat, dataset, network, unravel_fn)
+    c2_val = compute_sample_mean(params_flat, dataset, network, unravel_fn)
+    d1     = grad_kl(params_flat, dataset, network, unravel_fn)
+    d2     = grad_mean(params_flat, dataset, network, unravel_fn)
+
+    s0 = tau * g
+    # Linear approximations of the constraints:
+    c1_approx0 = c1_val + jnp.dot(d1, s0)
+    c2_approx0 = c2_val + jnp.dot(d2, s0)
+
+    unconstrained_feasible = (c1_approx0 <= delta) & (((1 - epsilon) <= c2_approx0) & (c2_approx0 <= (1 + epsilon)))
+    
+    # We'll update dual variables λ = [λ₁, λ₂, λ₃] using a quasi-Newton update.
+    # Initialize λ and an identity matrix for H_inv.
+    init_lambda = jnp.zeros(3)
+    H_inv = jnp.eye(3)  # initial inverse Hessian approximation
+    
+    def dual_cond(state):
+        i, lambd, s, H_inv = state
+        c1_approx = c1_val + jnp.dot(d1, s)
+        c2_approx = c2_val + jnp.dot(d2, s)
+        v1 = jnp.maximum(0.0, c1_approx - delta)
+        v2 = jnp.maximum(0.0, c2_approx - (1 + epsilon))
+        v3 = jnp.maximum(0.0, (1 - epsilon) - c2_approx)
+        violation = (v1 >= tol) | (v2 >= tol) | (v3 >= tol)
+        return violation & (i < max_dual_iters)
+    
+    def dual_body(state):
+        i, lambd, s, H_inv = state
+        # Compute the dual gradient vector:
+        # grad_dual = [c1_approx - delta, c2_approx - (1+epsilon), (1-epsilon) - c2_approx]
+        c1_approx = c1_val + jnp.dot(d1, s)
+        c2_approx = c2_val + jnp.dot(d2, s)
+        grad_dual = jnp.array([c1_approx - delta, c2_approx - (1 + epsilon), (1 - epsilon) - c2_approx])
+        
+        # Quasi-Newton update for the dual variables.
+        step = H_inv @ grad_dual
+        lambd_new = jnp.maximum(0.0, lambd + step)
+        
+        # Compute new s with updated duals.
+        # Here, s = τ * (g - λ₁ d₁ - (λ₂ - λ₃) d₂)
+        s_new = tau * (g - lambd_new[0] * d1 - (lambd_new[1] - lambd_new[2]) * d2)
+        
+        # For the BFGS update, we need to compute:
+        # y = grad_dual_new - grad_dual, and p = lambd_new - lambd.
+        # For simplicity, assume we can compute grad_dual_new similarly.
+        c1_approx_new = c1_val + jnp.dot(d1, s_new)
+        c2_approx_new = c2_val + jnp.dot(d2, s_new)
+        grad_dual_new = jnp.array([c1_approx_new - delta, c2_approx_new - (1 + epsilon), (1 - epsilon) - c2_approx_new])
+        p = lambd_new - lambd
+        y = grad_dual_new - grad_dual
+        
+        # Update H_inv using the BFGS formula:
+        # H_inv_new = (I - p y^T / (y^T p)) H_inv (I - y p^T / (y^T p)) + (p p^T) / (y^T p)
+        denom = jnp.dot(y, p) + 1e-8
+        I_dual = jnp.eye(3)
+        H_inv_new = (I_dual - jnp.outer(p, y) / denom) @ H_inv @ (I_dual - jnp.outer(y, p) / denom) + jnp.outer(p, p) / denom
+        
+        return (i + 1, lambd_new, s_new, H_inv_new)
+    
+    def dual_ascent_loop():
+        init_state = (0, init_lambda, s0, H_inv)
+        final_state = jax.lax.while_loop(dual_cond, dual_body, init_state)
+        return final_state[2]  # return s
+
+    s_final = jax.lax.cond(unconstrained_feasible,
+                           lambda _: s0,
+                           lambda _: dual_ascent_loop(),
+                           operand=None)
+    return s_final
 
 
 def dual_ascent_linear_obj_quadratic_con_all_jit(params_flat, dataset, network, unravel_fn, 
@@ -172,7 +317,8 @@ def make_train(config):
         init_x = jnp.zeros(env.observation_space(env_params).shape)
         network_params = network.init(_rng, init_x)
         tx = optax.chain(
-            optax.rmsprop(config["LR"], eps=1e-5),
+            # optax.rmsprop(config["LR"], eps=1e-5),
+            optax.rmsprop(config["LR"]),
         )
         train_state = TrainState.create(
             apply_fn=network.apply, params=network_params, tx=tx
@@ -328,14 +474,29 @@ def make_train(config):
             # Perform optimization
             for _ in range(config["NUM_UPDATES_PER_BATCH"]):
                 flat_params, unravel_fn = ravel_pytree(train_state.params)
-                grads_flat = dual_ascent_linear_obj_quadratic_con_all_jit(flat_params, batch, network, unravel_fn, 
+                # negative because we are maximizing the objective
+                # grads_flat =  - dual_ascent_linear_obj_quadratic_con_all_jit(flat_params, batch, network, unravel_fn, 
+                #                                                 delta=config.get("delta", 0.4),
+                #                                                 epsilon=config.get("epsilon", 0.05),
+                #                                                 tau=config.get("tau", 1.0),
+                #                                                 alpha_dual=config.get("alpha_dual", 1.0),
+                #                                                 tol=config.get("tol", 1e-4),
+                #                                                 max_dual_iters=config.get("max_dual_iters", 200),
+                #                                                 damping=config.get("damping", 1e-3))
+                grads_flat = - dual_ascent_linear_obj_linear_con_all_jit(flat_params, batch, network, unravel_fn, 
                                                                 delta=config.get("delta", 0.4),
                                                                 epsilon=config.get("epsilon", 0.05),
                                                                 tau=config.get("tau", 1.0),
                                                                 alpha_dual=config.get("alpha_dual", 1.0),
                                                                 tol=config.get("tol", 1e-4),
-                                                                max_dual_iters=config.get("max_dual_iters", 200),
-                                                                damping=config.get("damping", 1e-3))
+                                                                max_dual_iters=config.get("max_dual_iters", 200))
+                # grads_flat = - dual_ascent_linear_obj_linear_con_all_quasi_jit(flat_params, batch, network, unravel_fn,
+                #                                                 delta=config.get("delta", 0.4),
+                #                                                 epsilon=config.get("epsilon", 0.05),
+                #                                                 tau=config.get("tau", 1.0),
+                #                                                 tol=config.get("tol", 1e-4),
+                #                                                 max_dual_iters=config.get("max_dual_iters", 200))
+                
                 grads = unravel_fn(grads_flat)
                 (loss_val_, (loss_val, mean_ratio, mean_G0)) = \
                     loss_fn(train_state.params, batch)
@@ -343,6 +504,7 @@ def make_train(config):
                 total_loss_val += loss_val
                 total_ratio += mean_ratio
                 total_G0 += mean_G0
+                # negative because we are maximizing the objective
                 train_state = train_state.apply_gradients(grads=grads)
             
 
@@ -411,23 +573,24 @@ if __name__ == "__main__":
     # jax.config.update("jax_disable_jit", True)
     # jax.config.update('jax_platform_name', 'cpu')
     config = {
-        "LR": 5e-4,
+        "LR": 2.5e-4,
         "NUM_ENVS": 32,
         "TOTAL_EPISODES": 10000,
-        "GAMMA": 0.999,
+        "GAMMA": 1.0,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
-        "ENV_NAME": "CartPole-v1",
+        "ENV_NAME": "Acrobot-v1",
+        # "ENV_NAME": "Asterix-MinAtar",
         "MAX_EPISODE_LENGTH": 500,
-        "NUM_UPDATES_PER_BATCH": 5,
-        "delta": 0.4,
-        "epsilon": 0.1,
-        "tau": 1.0,
-        "alpha_dual": 1.0,
+        "NUM_UPDATES_PER_BATCH": 20,
+        "delta": 1.0,
+        "epsilon": 0.05,
+        "tau": 1e-3,
+        "alpha_dual": 1e-2,
         "tol": 1e-4,
         "max_dual_iters": 200,
-        "damping": 1e-3,
+        "damping": 1e-1,
         "DEBUG": True,
     }
     rng = jax.random.PRNGKey(30)

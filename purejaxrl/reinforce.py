@@ -397,12 +397,13 @@ if __name__ == "__main__":
         "ACTIVATION": "relu",
         "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,
-        "DEBUG": False,
+        "DEBUG": True,
     }
     rng = jax.random.PRNGKey(30)
     rngs = jax.random.split(rng, 60)
     
     train_jit = jax.jit(make_train(config))
+    out = train_jit(rng)
     import time
     current_time = time.time()
     out = jax.vmap(train_jit, in_axes=(0))(rngs)

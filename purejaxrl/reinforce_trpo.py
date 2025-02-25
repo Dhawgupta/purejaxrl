@@ -577,8 +577,6 @@ if __name__ == "__main__":
         "NUM_ENVS": 32,
         "TOTAL_EPISODES": 300,
         "GAMMA": 1.0,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
         "ENV_NAME": "Acrobot-v1",
         # "ENV_NAME": "Asterix-MinAtar",
@@ -599,6 +597,7 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(30)
     rngs = jax.random.split(rng, 60)
     train_jit = jax.jit(make_train(config))
+    # out = train_jit(rng)
     import time
     current_time = time.time()
     out = jax.vmap(train_jit, in_axes=(0))(rngs)

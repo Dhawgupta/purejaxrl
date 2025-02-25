@@ -295,8 +295,6 @@ if __name__ == "__main__":
         "NUM_ENVS": 32,
         "TOTAL_EPISODES": 300,  # Total update iterations (each based on NUM_ENVS full episodes)
         "GAMMA": 1.0,
-        "VF_COEF": 0.5,  # Not used in the IS objective here.
-        "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
         "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,

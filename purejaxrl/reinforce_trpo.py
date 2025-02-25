@@ -24,11 +24,11 @@ class ActorCritic(nn.Module):
             activation = nn.tanh
         # Actor network.
         actor_mean = nn.Dense(
-            32, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            16, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
-            32, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            16, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
@@ -418,11 +418,11 @@ if __name__ == "__main__":
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "relu",
-        "ENV_NAME": "Acrobot-v1",
+        "ENV_NAME": "CartPole-v1",
         "MAX_EPISODE_LENGTH": 500,
-        "NUM_UPDATES_PER_BATCH": 10,
+        "NUM_UPDATES_PER_BATCH": 5,
         "delta": 0.4,
-        "epsilon": 0.05,
+        "epsilon": 0.1,
         "tau": 1.0,
         "alpha_dual": 1.0,
         "tol": 1e-4,

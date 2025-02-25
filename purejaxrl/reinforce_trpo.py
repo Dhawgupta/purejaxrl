@@ -575,7 +575,7 @@ if __name__ == "__main__":
     config = {
         "LR": 2.5e-4,
         "NUM_ENVS": 32,
-        "TOTAL_EPISODES": 500,
+        "TOTAL_EPISODES": 300,
         "GAMMA": 1.0,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
@@ -591,16 +591,24 @@ if __name__ == "__main__":
         "tol": 1e-4,
         "max_dual_iters": 200,
         "damping": 1e-1,
-        "DEBUG": True,
+        "DEBUG": False,
     }
     # rng = jax.random.PRNGKey(30)
     # train_jit = jax.jit(make_train(config))
     # out = train_jit(rng)
     rng = jax.random.PRNGKey(30)
-    rngs = jax.random.split(rng, 30)
+    rngs = jax.random.split(rng, 60)
     train_jit = jax.jit(make_train(config))
+    import time
+    current_time = time.time()
     out = jax.vmap(train_jit, in_axes=(0))(rngs)
-    print(out["returns"].mean(axis=0))
+    print("Time taken: ", time.time() - current_time)
+    # print(out["returns"].mean(axis=0))
+    # save the results
+    import pickle
+    with open("reinforce_trpo.pkl", "wb") as f:
+        pickle.dump(out["returns"], f)
+
     import matplotlib.pyplot as plt
     plt.plot(out["returns"].mean(axis=0))
     plt.savefig("reinforce_trpo.png")

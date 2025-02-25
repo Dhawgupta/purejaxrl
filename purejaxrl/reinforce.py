@@ -372,13 +372,13 @@ def make_train(config):
             )
 
             new_runner_state = (train_state, new_env_state, new_obsv, rng)
-            return new_runner_state, total_loss
+            return new_runner_state, mean_return
 
         runner_state = (train_state, env_state, obsv, rng)
-        runner_state, losses = jax.lax.scan(
+        runner_state, returns = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "losses": losses}
+        return {"runner_state": runner_state, "returns": returns}
 
     return train
 
@@ -387,18 +387,31 @@ if __name__ == "__main__":
     import jax
     # jax.config.update("jax_disable_jit", True)
     config = {
-        "LR": 5e-4,
+        "LR": 2.5e-4,
         "NUM_ENVS": 32,
-        "TOTAL_EPISODES": 10000,  # Total update iterations (each based on NUM_ENVS full episodes)
-        "GAMMA": 0.99,
+        "TOTAL_EPISODES": 300,  # Total update iterations (each based on NUM_ENVS full episodes)
+        "GAMMA": 1.0,
         # "ENT_COEF": 0.01,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5, 
         "ACTIVATION": "relu",
         "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,
-        "DEBUG": True,
+        "DEBUG": False,
     }
     rng = jax.random.PRNGKey(30)
+    rngs = jax.random.split(rng, 60)
+    
     train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
+    import time
+    current_time = time.time()
+    out = jax.vmap(train_jit, in_axes=(0))(rngs)
+    print("Time taken: ", time.time() - current_time)
+    # print(out["returns"].mean(axis=0))
+    # save the results
+    import pickle
+    with open("reinforce.pkl", "wb") as f:
+        pickle.dump(out["returns"], f)
+    import matplotlib.pyplot as plt
+    plt.plot(out["returns"].mean(axis=0))
+    plt.savefig("reinforce.png")

@@ -276,13 +276,13 @@ def make_train(config):
                 reset_rngs, env_params
             )
             new_runner_state = (train_state, new_env_state, new_obsv, rng)
-            return new_runner_state, total_loss
+            return new_runner_state, mean_return
 
         runner_state = (train_state, env_state, obsv, rng)
-        runner_state, losses = jax.lax.scan(
+        runner_state, returns = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "losses": losses}
+        return {"runner_state": runner_state, "returns": returns}
 
     return train
 
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     config = {
         "LR": 2.5e-4,
         "NUM_ENVS": 32,
-        "TOTAL_EPISODES": 10000,  # Total update iterations (each based on NUM_ENVS full episodes)
+        "TOTAL_EPISODES": 500,  # Total update iterations (each based on NUM_ENVS full episodes)
         "GAMMA": 1.0,
         "VF_COEF": 0.5,  # Not used in the IS objective here.
         "MAX_GRAD_NORM": 0.5,
@@ -301,8 +301,17 @@ if __name__ == "__main__":
         "ENV_NAME": "Acrobot-v1",
         "MAX_EPISODE_LENGTH": 500,
         "NUM_UPDATES_PER_BATCH": 20,
-        "DEBUG": True,
+        "DEBUG": False,
     }
     rng = jax.random.PRNGKey(30)
+    rngs = jax.random.split(rng, 30)
+    
     train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
+    import time
+    current_time = time.time()
+    out = jax.vmap(train_jit, in_axes=(0))(rngs)
+    print("Time taken: ", time.time() - current_time)
+    print(out["returns"].mean(axis=0))
+    import matplotlib.pyplot as plt
+    plt.plot(out["returns"].mean(axis=0))
+    plt.savefig("reinforce_is.png")
